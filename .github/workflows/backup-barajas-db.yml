@@ -1,0 +1,66 @@
+name: Backup Histórico Barajas DB
+
+on:
+  # Programa la ejecución de esta acción cada hora a los 5 minutos (:05)
+  # Esto da tiempo para que la tarea horaria de recolección de Render termine.
+  schedule:
+    - cron: '5 * * * *'
+  # Permite la ejecución manual desde la pestaña "Actions" de GitHub
+  workflow_dispatch:
+
+permissions:
+  contents: write            # Necesario para que la acción pueda hacer push (subir archivos)
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Código
+        uses: actions/checkout@v4
+        
+      # 1. LLAMAR A /recolectar (Salvaguarda opcional)
+      - name: Llamar a /recolectar para asegurar DB actualizada
+        run: |
+          # URL BASE DEL SERVICIO DE RENDER (PROPORCIONADA POR EL USUARIO)
+          RENDER_BASE_URL="https://airlabs-recolector.onrender.com"
+          RECOLECTOR_URL="${RENDER_BASE_URL}/recolectar"
+          echo "Asegurando recolección en $RECOLECTOR_URL..."
+          # curl -s llama silenciosamente al endpoint /recolectar
+          curl -s "$RECOLECTOR_URL"
+          echo "Esperando 10s para que Render persista la DB..."
+          sleep 10
+          
+      # 2. DESCARGAR barajas.db
+      - name: Descargar barajas.db
+        run: |
+          # URL BASE DEL SERVICIO DE RENDER (PROPORCIONADA POR EL USUARIO)
+          RENDER_BASE_URL="https://airlabs-recolector.onrender.com"
+          DOWNLOAD_URL="${RENDER_BASE_URL}/descargarDB"
+          echo "Descargando DB desde $DOWNLOAD_URL..."
+          # -L sigue redirecciones, -o guarda con el nombre especificado
+          curl -L -o barajas.db "$DOWNLOAD_URL"
+          
+          if [ ! -s barajas.db ]; then
+            echo "❌ Error: el archivo barajas.db está vacío o no se pudo descargar."
+            exit 1
+          fi
+
+      # 3. CREAR CARPETA Y MOVER ARCHIVO
+      - name: Crear carpeta y mover archivo a Backup Histórico
+        run: |
+          # Crea el directorio si no existe
+          mkdir -p backups/barajas
+          # Genera la marca de tiempo
+          TS=$(date +"%Y-%m-%d_%H-%M")
+          # Renombra el archivo y lo mueve a la carpeta de backups
+          mv barajas.db "backups/barajas/barajas_$TS.db"
+          # Exporta el timestamp como variable de entorno para el mensaje de commit
+          echo "TS=$TS" >> $GITHUB_ENV
+
+      # 4. CONFIGURAR Y SUBIR ARCHIVOS AL REPOSITORIO
+      - name: Subir Backup a GitHub
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Backup automático Barajas: ${{ env.TS }}"
+          # Solo commitea los archivos dentro de la carpeta de backups
+          files: backups/barajas/
