@@ -31,7 +31,6 @@ def airlabs_request(endpoint, params):
     print(f"Haciendo petición a {url} con status={params.get('status')}...")
     try:
         if API_KEY == "TU_CLAVE_DE_AIRLABS_AQUI":
-             # Esto forzará un error si el usuario no ha configurado su clave
              raise RuntimeError("API Key no configurada. Por favor, define AIRLABS_API_KEY en Render.")
              
         r = requests.get(url, params=params, timeout=20)
@@ -85,18 +84,19 @@ def save_arrivals(records):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # DDL: Se añaden 6 nuevos campos: arr_terminal, arr_gate, arr_baggage, duration, dep_delayed y arr_delayed
+    # DDL: Se añade el campo aircraft_icao (modelo del avión)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS arrivals (
             timestamp TEXT, flight_iata TEXT, airline_iata TEXT, dep_iata TEXT,
             arr_iata TEXT, arr_sch_time TEXT, arr_time TEXT, status TEXT,
             delay_minutes INTEGER, 
-            arr_terminal TEXT,       -- NUEVO CAMPO
-            arr_gate TEXT,           -- NUEVO CAMPO
-            arr_baggage TEXT,        -- NUEVO CAMPO
-            duration INTEGER,        -- NUEVO CAMPO
-            dep_delayed INTEGER,     -- RETRASO OFICIAL
-            arr_delayed INTEGER,     -- RETRASO OFICIAL
+            arr_terminal TEXT,       
+            arr_gate TEXT,           
+            arr_baggage TEXT,        
+            duration INTEGER,        
+            dep_delayed INTEGER,     
+            arr_delayed INTEGER,     
+            aircraft_icao TEXT,      -- ¡NUEVO CAMPO!
             PRIMARY KEY (flight_iata, arr_time) 
         )
     """)
@@ -116,23 +116,25 @@ def save_arrivals(records):
             
         delay = calculate_delay(arr_time, arr_sch_time)
         
-        # Extracción de los 6 nuevos datos complementarios
+        # Extracción de todos los datos complementarios
         arr_terminal = r.get("arr_terminal")
         arr_gate = r.get("arr_gate")
         arr_baggage = r.get("arr_baggage")
         duration = r.get("duration")
-        dep_delayed = r.get("dep_delayed") # Retraso oficial de salida
-        arr_delayed = r.get("arr_delayed") # Retraso oficial de llegada
+        dep_delayed = r.get("dep_delayed")
+        arr_delayed = r.get("arr_delayed")
+        aircraft_icao = r.get("aircraft_icao") # ¡Extracción del nuevo campo!
 
             
         try:
-            # DML: Se insertan 15 valores (9 originales + 6 nuevos)
+            # DML: Se insertan 16 valores (9 originales + 7 nuevos)
             cursor.execute("""
-                INSERT OR IGNORE INTO arrivals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO arrivals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 timestamp_recolection, flight_iata, r.get("airline_iata"), r.get("dep_iata"),
                 r.get("arr_iata"), arr_sch_time, arr_time, r.get("status"), delay,
-                arr_terminal, arr_gate, arr_baggage, duration, dep_delayed, arr_delayed  # INSERCIÓN DE NUEVOS CAMPOS
+                arr_terminal, arr_gate, arr_baggage, duration, dep_delayed, arr_delayed, 
+                aircraft_icao # ¡Inserción del nuevo campo!
             ))
         except Exception as e:
             print(f"Error al insertar llegada {flight_iata}: {e}")
@@ -146,17 +148,18 @@ def save_departures(records):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # DDL: Se añaden 5 nuevos campos: dep_terminal, dep_gate, duration, dep_delayed y arr_delayed
+    # DDL: Se añade el campo aircraft_icao (modelo del avión)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS departures (
             timestamp TEXT, flight_iata TEXT, airline_iata TEXT, dep_iata TEXT,
             arr_iata TEXT, dep_sch_time TEXT, dep_time TEXT, status TEXT,
             delay_minutes INTEGER,
-            dep_terminal TEXT,       -- CAMPO COMPLEMENTARIO
-            dep_gate TEXT,           -- CAMPO COMPLEMENTARIO
-            duration INTEGER,        -- CAMPO COMPLEMENTARIO
-            dep_delayed INTEGER,     -- RETRASO OFICIAL
-            arr_delayed INTEGER,     -- RETRASO OFICIAL
+            dep_terminal TEXT,       
+            dep_gate TEXT,           
+            duration INTEGER,        
+            dep_delayed INTEGER,     
+            arr_delayed INTEGER,     
+            aircraft_icao TEXT,      -- ¡NUEVO CAMPO!
             PRIMARY KEY (flight_iata, dep_sch_time)
         )
     """)
@@ -176,22 +179,23 @@ def save_departures(records):
             
         delay = calculate_delay(dep_time, dep_sch_time)
         
-        # Extracción de los 5 datos complementarios
+        # Extracción de todos los datos complementarios
         dep_terminal = r.get("dep_terminal")
         dep_gate = r.get("dep_gate")
         duration = r.get("duration")
-        dep_delayed = r.get("dep_delayed") # Retraso oficial de salida
-        arr_delayed = r.get("arr_delayed") # Retraso oficial de llegada
-
+        dep_delayed = r.get("dep_delayed")
+        arr_delayed = r.get("arr_delayed")
+        aircraft_icao = r.get("aircraft_icao") # ¡Extracción del nuevo campo!
             
         try:
-            # DML: Se insertan 14 valores (9 originales + 5 complementarios)
+            # DML: Se insertan 15 valores (9 originales + 6 complementarios)
             cursor.execute("""
-                INSERT OR IGNORE INTO departures VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO departures VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 timestamp_recolection, flight_iata, r.get("airline_iata"), r.get("dep_iata"),
                 r.get("arr_iata"), dep_sch_time, dep_time, r.get("status"), delay,
-                dep_terminal, dep_gate, duration, dep_delayed, arr_delayed  # INSERCIÓN DE NUEVOS CAMPOS
+                dep_terminal, dep_gate, duration, dep_delayed, arr_delayed,
+                aircraft_icao # ¡Inserción del nuevo campo!
             ))
         except Exception as e:
             print(f"Error al insertar despegue/activo {flight_iata}: {e}")
