@@ -1,6 +1,0 @@
-requests
-sqlite3 # Ya viene con Python
-python-dateutil
-pytz
-Flask
-gunicorn
