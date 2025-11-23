@@ -29,7 +29,8 @@ def airlabs_request(endpoint, params):
     params = dict(params)
     params["api_key"] = API_KEY
 
-    print(f"Haciendo petición a {url} con params={params}...")
+    # Ahora incluimos la información de la petición en el print para depuración
+    print(f"Haciendo petición a {url} con status={params.get('status')}...")
     try:
         r = requests.get(url, params=params, timeout=20)
         r.raise_for_status() 
@@ -56,23 +57,15 @@ def get_all_landed():
         {"arr_iata": AIRPORT_IATA, "status": "landed"}
     )
 
-def get_all_departed():
-    """Obtiene los últimos 100 vuelos despegados de MAD."""
-    return airlabs_request(
-        "schedules",
-        {"dep_iata": AIRPORT_IATA, "status": "departed"}
-    )
-
 def get_all_active_departures():
     """
-    [NUEVA FUNCIÓN] Obtiene los últimos vuelos activos (scheduled/en route) 
-    saliendo de MAD, que incluye vuelos que están a punto de salir o en el aire.
+    [NUEVA/CORREGIDA FUNCIÓN] Obtiene los últimos vuelos activos (scheduled/en route) 
+    saliendo de MAD. REEMPLAZA a get_all_departed() para ahorrar consultas.
     """
     return airlabs_request(
         "schedules",
         {"dep_iata": AIRPORT_IATA, "status": "active"}
     )
-
 
 def calculate_delay(actual_time_str, scheduled_time_str):
     """Calcula la diferencia en minutos entre el tiempo real y el programado/estimado."""
@@ -95,7 +88,6 @@ def save_arrivals(records):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # DDL: Sin cambios necesarios en llegadas
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS arrivals (
             timestamp TEXT, flight_iata TEXT, airline_iata TEXT, dep_iata TEXT,
@@ -138,15 +130,16 @@ def save_departures(records):
     cursor = conn.cursor()
 
     # DDL: Se añaden dep_terminal, dep_gate y duration
+    # Y se cambia la PK a (flight_iata, dep_sch_time) para mayor fiabilidad con vuelos activos
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS departures (
             timestamp TEXT, flight_iata TEXT, airline_iata TEXT, dep_iata TEXT,
             arr_iata TEXT, dep_sch_time TEXT, dep_time TEXT, status TEXT,
             delay_minutes INTEGER,
-            dep_terminal TEXT,       -- NUEVO CAMPO
-            dep_gate TEXT,           -- NUEVO CAMPO
-            duration INTEGER,        -- NUEVO CAMPO
-            PRIMARY KEY (flight_iata, dep_time)
+            dep_terminal TEXT,       -- CAMPO COMPLEMENTARIO
+            dep_gate TEXT,           -- CAMPO COMPLEMENTARIO
+            duration INTEGER,        -- CAMPO COMPLEMENTARIO
+            PRIMARY KEY (flight_iata, dep_sch_time)
         )
     """)
 
@@ -155,7 +148,7 @@ def save_departures(records):
     
     for r in records:
         flight_iata = r.get("flight_iata")
-        # dep_time será NULL para los vuelos 'active', pero tendrá valor para 'departed'
+        # dep_time será NULL para los vuelos 'active' que aún no han despegado
         dep_time = r.get("dep_time") 
         dep_sch_time = r.get("dep_time_sch")
         if not dep_sch_time:
@@ -174,7 +167,7 @@ def save_departures(records):
         duration = r.get("duration")
             
         try:
-            # DML: Se insertan 3 valores adicionales (total de 12 valores)
+            # DML: Se insertan 12 valores (9 originales + 3 complementarios)
             cursor.execute("""
                 INSERT OR IGNORE INTO departures VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
@@ -204,7 +197,6 @@ def home():
 def ping_service():
     """
     Endpoint simple para mantener el servicio activo y evitar que Render lo apague.
-    Debe ser llamado por un servicio externo (cron-job.org) cada 5-10 minutos.
     No consume llamadas a AirLabs.
     """
     now = datetime.now(MADRID_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -214,8 +206,8 @@ def ping_service():
 @app.get("/recolectar")
 def recolectar():
     """
-    Ejecuta la recolección de datos y los guarda en barajas.db, incluyendo
-    llegadas aterrizadas, salidas despegadas y SALIDAS ACTIVAS.
+    Ejecuta la recolección de datos y los guarda en barajas.db.
+    Solo llama a 'landed' y 'active' (2 llamadas a API).
     """
     total_inserted = 0
     results = {}
@@ -229,32 +221,24 @@ def recolectar():
     except RuntimeError as e:
         results["error_llegadas"] = f"Error en recolección de llegadas: {e}"
 
-    # 2. COLECCIÓN DE DESPEGUES (departed)
-    try:
-        all_departed = get_all_departed()
-        inserted_departures = save_departures(all_departed) if all_departed else 0
-        results["nuevos_registros_despegues"] = inserted_departures
-        total_inserted += inserted_departures
-    except RuntimeError as e:
-        results["error_despegues"] = f"Error en recolección de despegues: {e}"
-
-    # 3. COLECCIÓN DE SALIDAS ACTIVAS (active) - ¡EL NUEVO REQUISITO!
+    # 2. COLECCIÓN DE SALIDAS ACTIVAS (active) - REEMPLAZANDO A 'departed'
     try:
         all_active = get_all_active_departures()
-        # Se guarda en la MISMA tabla 'departures'
-        inserted_active = save_departures(all_active) if all_active else 0
-        results["nuevos_registros_salidas_activas"] = inserted_active
-        total_inserted += inserted_active
+        inserted_departures = save_departures(all_active) if all_active else 0
+        results["nuevos_registros_salidas_activas"] = inserted_departures
+        total_inserted += inserted_departures
     except RuntimeError as e:
         results["error_salidas_activas"] = f"Error en recolección de salidas activas: {e}"
     
     if total_inserted > 0:
         results["mensaje"] = f"Recolección completada con éxito. Total de nuevos registros: {total_inserted}."
+        status_code = 200
     else:
         results["mensaje"] = "Recolección completada. No se insertaron registros nuevos."
+        # Si hubo errores en las dos llamadas, devolvemos 500
+        status_code = 500 if "error_llegadas" in results or "error_salidas_activas" in results else 200
         
-    return JSONResponse(content=results, status_code=500 if "error" in str(results) else 200)
-
+    return JSONResponse(content=results, status_code=status_code)
 
 @app.get("/descargarDB")
 def descargar_db():
@@ -264,4 +248,3 @@ def descargar_db():
         return FileResponse(DB_PATH, filename="barajas.db", media_type="application/octet-stream")
     else:
         return JSONResponse(content={"error": "Base de datos no encontrada"}, status_code=404)
-
