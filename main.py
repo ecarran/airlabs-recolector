@@ -11,7 +11,6 @@ import pytz
 # CONSTANTES
 # ==================================
 # Se lee la clave de la variable de entorno AIRLABS_API_KEY.
-# La clave por defecto es un placeholder; asegúrate de configurar la variable en Render.
 API_KEY = os.getenv("AIRLABS_API_KEY", "TU_CLAVE_DE_AIRLABS_AQUI") 
 AIRPORT_IATA = "MAD"
 DB_PATH = "barajas.db"
@@ -29,15 +28,17 @@ def airlabs_request(endpoint, params):
     params = dict(params)
     params["api_key"] = API_KEY
 
-    # Ahora incluimos la información de la petición en el print para depuración
     print(f"Haciendo petición a {url} con status={params.get('status')}...")
     try:
+        if API_KEY == "TU_CLAVE_DE_AIRLABS_AQUI":
+             # Esto forzará un error si el usuario no ha configurado su clave
+             raise RuntimeError("API Key no configurada. Por favor, define AIRLABS_API_KEY en Render.")
+             
         r = requests.get(url, params=params, timeout=20)
         r.raise_for_status() 
         data = r.json()
 
         if "error" in data:
-            # Captura errores de la API como límite de uso
             raise RuntimeError(f"Error de API: {data['error']}")
         
         response = data.get("response")
@@ -47,21 +48,17 @@ def airlabs_request(endpoint, params):
         return response
     
     except requests.exceptions.RequestException as e:
-        # Captura errores de red, DNS, timeouts, etc.
         raise RuntimeError(f"Error en la petición HTTP: {e}")
 
 def get_all_landed():
-    """Obtiene los últimos 100 vuelos aterrizados en MAD."""
+    """Obtiene los últimos 100 vuelos aterrizados en MAD (1 llamada)."""
     return airlabs_request(
         "schedules",
         {"arr_iata": AIRPORT_IATA, "status": "landed"}
     )
 
 def get_all_active_departures():
-    """
-    [NUEVA/CORREGIDA FUNCIÓN] Obtiene los últimos vuelos activos (scheduled/en route) 
-    saliendo de MAD. REEMPLAZA a get_all_departed() para ahorrar consultas.
-    """
+    """Obtiene vuelos activos saliendo de MAD (1 llamada)."""
     return airlabs_request(
         "schedules",
         {"dep_iata": AIRPORT_IATA, "status": "active"}
@@ -88,11 +85,19 @@ def save_arrivals(records):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
+    # DDL: Se añaden 6 nuevos campos: arr_terminal, arr_gate, arr_baggage, duration, dep_delayed y arr_delayed
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS arrivals (
             timestamp TEXT, flight_iata TEXT, airline_iata TEXT, dep_iata TEXT,
             arr_iata TEXT, arr_sch_time TEXT, arr_time TEXT, status TEXT,
-            delay_minutes INTEGER, PRIMARY KEY (flight_iata, arr_time) 
+            delay_minutes INTEGER, 
+            arr_terminal TEXT,       -- NUEVO CAMPO
+            arr_gate TEXT,           -- NUEVO CAMPO
+            arr_baggage TEXT,        -- NUEVO CAMPO
+            duration INTEGER,        -- NUEVO CAMPO
+            dep_delayed INTEGER,     -- RETRASO OFICIAL
+            arr_delayed INTEGER,     -- RETRASO OFICIAL
+            PRIMARY KEY (flight_iata, arr_time) 
         )
     """)
     
@@ -110,13 +115,25 @@ def save_arrivals(records):
             continue
             
         delay = calculate_delay(arr_time, arr_sch_time)
+        
+        # Extracción de los 6 nuevos datos complementarios
+        arr_terminal = r.get("arr_terminal")
+        arr_gate = r.get("arr_gate")
+        arr_baggage = r.get("arr_baggage")
+        duration = r.get("duration")
+        dep_delayed = r.get("dep_delayed") # Retraso oficial de salida
+        arr_delayed = r.get("arr_delayed") # Retraso oficial de llegada
+
             
         try:
+            # DML: Se insertan 15 valores (9 originales + 6 nuevos)
             cursor.execute("""
-                INSERT OR IGNORE INTO arrivals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO arrivals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 timestamp_recolection, flight_iata, r.get("airline_iata"), r.get("dep_iata"),
-                r.get("arr_iata"), arr_sch_time, arr_time, r.get("status"), delay))
+                r.get("arr_iata"), arr_sch_time, arr_time, r.get("status"), delay,
+                arr_terminal, arr_gate, arr_baggage, duration, dep_delayed, arr_delayed  # INSERCIÓN DE NUEVOS CAMPOS
+            ))
         except Exception as e:
             print(f"Error al insertar llegada {flight_iata}: {e}")
 
@@ -129,8 +146,7 @@ def save_departures(records):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # DDL: Se añaden dep_terminal, dep_gate y duration
-    # Y se cambia la PK a (flight_iata, dep_sch_time) para mayor fiabilidad con vuelos activos
+    # DDL: Se añaden 5 nuevos campos: dep_terminal, dep_gate, duration, dep_delayed y arr_delayed
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS departures (
             timestamp TEXT, flight_iata TEXT, airline_iata TEXT, dep_iata TEXT,
@@ -139,6 +155,8 @@ def save_departures(records):
             dep_terminal TEXT,       -- CAMPO COMPLEMENTARIO
             dep_gate TEXT,           -- CAMPO COMPLEMENTARIO
             duration INTEGER,        -- CAMPO COMPLEMENTARIO
+            dep_delayed INTEGER,     -- RETRASO OFICIAL
+            arr_delayed INTEGER,     -- RETRASO OFICIAL
             PRIMARY KEY (flight_iata, dep_sch_time)
         )
     """)
@@ -148,32 +166,32 @@ def save_departures(records):
     
     for r in records:
         flight_iata = r.get("flight_iata")
-        # dep_time será NULL para los vuelos 'active' que aún no han despegado
         dep_time = r.get("dep_time") 
         dep_sch_time = r.get("dep_time_sch")
         if not dep_sch_time:
             dep_sch_time = r.get("dep_estimated")
             
-        # Nos aseguramos de tener la información mínima
         if not flight_iata or not dep_sch_time:
             continue 
             
-        # El delay solo se calcula si dep_time (real) existe
         delay = calculate_delay(dep_time, dep_sch_time)
         
-        # Nuevos datos complementarios
+        # Extracción de los 5 datos complementarios
         dep_terminal = r.get("dep_terminal")
         dep_gate = r.get("dep_gate")
         duration = r.get("duration")
+        dep_delayed = r.get("dep_delayed") # Retraso oficial de salida
+        arr_delayed = r.get("arr_delayed") # Retraso oficial de llegada
+
             
         try:
-            # DML: Se insertan 12 valores (9 originales + 3 complementarios)
+            # DML: Se insertan 14 valores (9 originales + 5 complementarios)
             cursor.execute("""
-                INSERT OR IGNORE INTO departures VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO departures VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 timestamp_recolection, flight_iata, r.get("airline_iata"), r.get("dep_iata"),
                 r.get("arr_iata"), dep_sch_time, dep_time, r.get("status"), delay,
-                dep_terminal, dep_gate, duration  # INSERCIÓN DE NUEVOS CAMPOS
+                dep_terminal, dep_gate, duration, dep_delayed, arr_delayed  # INSERCIÓN DE NUEVOS CAMPOS
             ))
         except Exception as e:
             print(f"Error al insertar despegue/activo {flight_iata}: {e}")
@@ -195,10 +213,7 @@ def home():
 
 @app.get("/ping")
 def ping_service():
-    """
-    Endpoint simple para mantener el servicio activo y evitar que Render lo apague.
-    No consume llamadas a AirLabs.
-    """
+    """Endpoint simple para mantener el servicio activo."""
     now = datetime.now(MADRID_TZ).strftime("%Y-%m-%d %H:%M:%S")
     return JSONResponse(content={"status": "alive", "timestamp_madrid": now, "message": "Service is awake."}, status_code=200)
 
@@ -221,7 +236,7 @@ def recolectar():
     except RuntimeError as e:
         results["error_llegadas"] = f"Error en recolección de llegadas: {e}"
 
-    # 2. COLECCIÓN DE SALIDAS ACTIVAS (active) - REEMPLAZANDO A 'departed'
+    # 2. COLECCIÓN DE SALIDAS ACTIVAS (active)
     try:
         all_active = get_all_active_departures()
         inserted_departures = save_departures(all_active) if all_active else 0
@@ -235,7 +250,6 @@ def recolectar():
         status_code = 200
     else:
         results["mensaje"] = "Recolección completada. No se insertaron registros nuevos."
-        # Si hubo errores en las dos llamadas, devolvemos 500
         status_code = 500 if "error_llegadas" in results or "error_salidas_activas" in results else 200
         
     return JSONResponse(content=results, status_code=status_code)
@@ -244,7 +258,6 @@ def recolectar():
 def descargar_db():
     """Permite descargar el archivo de base de datos SQLite."""
     if os.path.exists(DB_PATH):
-        # Usamos FileResponse de FastAPI para servir el archivo
         return FileResponse(DB_PATH, filename="barajas.db", media_type="application/octet-stream")
     else:
         return JSONResponse(content={"error": "Base de datos no encontrada"}, status_code=404)
