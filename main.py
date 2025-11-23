@@ -10,8 +10,9 @@ import pytz
 # ==================================
 # CONSTANTES
 # ==================================
-# Usamos una variable de entorno para la clave API (MEJOR PRÁCTICA DE SEGURIDAD)
-API_KEY = os.getenv("AIRLABS_API_KEY", "TU_CLAVE_AQUI") 
+# Se lee la clave de la variable de entorno AIRLABS_API_KEY.
+# La clave por defecto es un placeholder; asegúrate de configurar la variable en Render.
+API_KEY = os.getenv("AIRLABS_API_KEY", "TU_CLAVE_DE_AIRLABS_AQUI") 
 AIRPORT_IATA = "MAD"
 DB_PATH = "barajas.db"
 MADRID_TZ = pytz.timezone('Europe/Madrid')
@@ -159,9 +160,26 @@ def save_departures(records):
 # ENDPOINTS
 # ==================================
 
+@app.get("/")
+def home():
+    """Página de inicio básica."""
+    return {"message": "Recolector de Vuelos de Barajas activo. Use /recolectar o /descargarDB."}
+
+
+@app.get("/ping")
+def ping_service():
+    """
+    Endpoint simple para mantener el servicio activo y evitar que Render lo apague.
+    Debe ser llamado por un servicio externo (cron-job.org) cada 5-10 minutos.
+    No consume llamadas a AirLabs.
+    """
+    now = datetime.now(MADRID_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return JSONResponse(content={"status": "alive", "timestamp_madrid": now, "message": "Service is awake."}, status_code=200)
+
+
 @app.get("/recolectar")
 def recolectar():
-    """Ejecuta la recolección de datos y los guarda en barajas.db."""
+    """Ejecuta la recolección de datos y los guarda en barajas.db (llamada de cron-job de Render)."""
     
     # 1. COLECCIÓN DE LLEGADAS
     try:
