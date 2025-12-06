@@ -4,7 +4,7 @@ on:
   # Programa la ejecución de esta acción cada hora a los 5 minutos (:05)
   # Esto da tiempo para que la tarea horaria de recolección de Render termine.
   schedule:
-    - cron: '5 */4 * * *'
+    - cron: '5 0,12 * * *'
   # Permite la ejecución manual desde la pestaña "Actions" de GitHub
   workflow_dispatch:
 
