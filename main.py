@@ -81,11 +81,14 @@ def calculate_delay(actual_time_str, scheduled_time_str):
 # GUARDADO DE DATOS (Recolección y guardado)
 # ==================================
 
+# ==================================
+# GUARDADO DE DATOS (CORREGIDO)
+# ==================================
+
 def save_arrivals(records):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # DDL: Se añade el campo aircraft_icao (modelo del avión)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS arrivals (
             timestamp TEXT, flight_iata TEXT, airline_iata TEXT, dep_iata TEXT,
@@ -97,46 +100,54 @@ def save_arrivals(records):
             duration INTEGER,        
             dep_delayed INTEGER,     
             arr_delayed INTEGER,     
-            aircraft_icao TEXT,      -- ¡NUEVO CAMPO!
+            aircraft_icao TEXT,
             PRIMARY KEY (flight_iata, arr_time) 
         )
     """)
     
-    # --- CAMBIO: Uso de la hora de Madrid ---
     timestamp_recolection = datetime.now(MADRID_TZ).strftime("%Y-%m-%d %H:%M:%S")
     initial_changes = conn.total_changes
     
     for r in records:
         flight_iata = r.get("flight_iata")
-        arr_time = r.get("arr_time") 
-        arr_sch_time = r.get("arr_time_sch")
-        if not arr_sch_time:
-            arr_sch_time = r.get("arr_estimated")
         
+        # --- CORRECCIÓN DE ASIGNACIÓN DE TIEMPOS ---
+        # 1. Hora Programada (Scheduled): Estricta
+        arr_sch_time = r.get("arr_time_sch")
+        
+        # 2. Hora Real (Live): Priorizamos estimada/actual, fallback a genérica
+        arr_time = r.get("arr_estimated") or r.get("arr_actual") or r.get("arr_time")
+        
+        # Si no tenemos hora real, no podemos guardar el registro útilmente
         if not flight_iata or not arr_time:
             continue
+        
+        # Si falta la programada, intentamos usar 'arr_time' original si es distinto al estimado,
+        # o simplemente lo dejamos como None, pero NUNCA metemos la estimada aquí a ciegas.
+        if not arr_sch_time:
+             # Opcional: Si no hay programada, asume que la programada era la 'arr_time' genérica
+             # Solo haz esto si estás seguro, si no, déjalo pasar o marca como NULL
+             arr_sch_time = r.get("arr_time") 
             
         delay = calculate_delay(arr_time, arr_sch_time)
+        # -------------------------------------------
         
-        # Extracción de todos los datos complementarios
         arr_terminal = r.get("arr_terminal")
         arr_gate = r.get("arr_gate")
         arr_baggage = r.get("arr_baggage")
         duration = r.get("duration")
         dep_delayed = r.get("dep_delayed")
         arr_delayed = r.get("arr_delayed")
-        aircraft_icao = r.get("aircraft_icao") # ¡Extracción del nuevo campo!
+        aircraft_icao = r.get("aircraft_icao")
 
-            
         try:
-            # DML: Se insertan 16 valores (9 originales + 7 nuevos)
             cursor.execute("""
                 INSERT OR IGNORE INTO arrivals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 timestamp_recolection, flight_iata, r.get("airline_iata"), r.get("dep_iata"),
                 r.get("arr_iata"), arr_sch_time, arr_time, r.get("status"), delay,
                 arr_terminal, arr_gate, arr_baggage, duration, dep_delayed, arr_delayed, 
-                aircraft_icao # ¡Inserción del nuevo campo!
+                aircraft_icao
             ))
         except Exception as e:
             print(f"Error al insertar llegada {flight_iata}: {e}")
@@ -150,7 +161,6 @@ def save_departures(records):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # DDL: Se añade el campo aircraft_icao (modelo del avión)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS departures (
             timestamp TEXT, flight_iata TEXT, airline_iata TEXT, dep_iata TEXT,
@@ -161,44 +171,52 @@ def save_departures(records):
             duration INTEGER,        
             dep_delayed INTEGER,     
             arr_delayed INTEGER,     
-            aircraft_icao TEXT,      -- ¡NUEVO CAMPO!
+            aircraft_icao TEXT,
             PRIMARY KEY (flight_iata, dep_sch_time)
         )
     """)
 
-    # --- CAMBIO: Uso de la hora de Madrid ---
     timestamp_recolection = datetime.now(MADRID_TZ).strftime("%Y-%m-%d %H:%M:%S")
     initial_changes = conn.total_changes
     
     for r in records:
         flight_iata = r.get("flight_iata")
-        dep_time = r.get("dep_time") 
+        
+        # --- CORRECCIÓN DE ASIGNACIÓN DE TIEMPOS ---
+        # 1. Hora Programada (Scheduled)
         dep_sch_time = r.get("dep_time_sch")
-        if not dep_sch_time:
-            dep_sch_time = r.get("dep_estimated")
-            
+        
+        # 2. Hora Real (Live): Priorizamos estimada/actual
+        dep_time = r.get("dep_estimated") or r.get("dep_actual") or r.get("dep_time")
+
         if not flight_iata or not dep_sch_time:
-            continue 
+            # Nota: Si dep_sch_time es crítico para tu Primary Key, 
+            # podrías intentar usar r.get("dep_time") como último recurso para sch,
+            # pero SOLO si no es igual al estimado.
+            if not dep_sch_time and r.get("dep_time"):
+                 dep_sch_time = r.get("dep_time")
+            
+            if not dep_sch_time:
+                continue 
+        # -------------------------------------------
             
         delay = calculate_delay(dep_time, dep_sch_time)
         
-        # Extracción de todos los datos complementarios
         dep_terminal = r.get("dep_terminal")
         dep_gate = r.get("dep_gate")
         duration = r.get("duration")
         dep_delayed = r.get("dep_delayed")
         arr_delayed = r.get("arr_delayed")
-        aircraft_icao = r.get("aircraft_icao") # ¡Extracción del nuevo campo!
+        aircraft_icao = r.get("aircraft_icao")
             
         try:
-            # DML: Se insertan 15 valores (9 originales + 6 complementarios)
             cursor.execute("""
                 INSERT OR IGNORE INTO departures VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 timestamp_recolection, flight_iata, r.get("airline_iata"), r.get("dep_iata"),
                 r.get("arr_iata"), dep_sch_time, dep_time, r.get("status"), delay,
                 dep_terminal, dep_gate, duration, dep_delayed, arr_delayed,
-                aircraft_icao # ¡Inserción del nuevo campo!
+                aircraft_icao
             ))
         except Exception as e:
             print(f"Error al insertar despegue/activo {flight_iata}: {e}")
@@ -269,3 +287,4 @@ def descargar_db():
         return FileResponse(DB_PATH, filename="barajas.db", media_type="application/octet-stream")
     else:
         return JSONResponse(content={"error": "Base de datos no encontrada"}, status_code=404)
+
