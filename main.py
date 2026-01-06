@@ -14,6 +14,7 @@ import pytz
 API_KEY = os.getenv("AIRLABS_API_KEY", "TU_CLAVE_DE_AIRLABS_AQUI") 
 AIRPORT_IATA = "MAD"
 DB_PATH = "barajas.db"
+# --- CAMBIO: Definición de la zona horaria ---
 MADRID_TZ = pytz.timezone('Europe/Madrid')
 
 app = FastAPI()
@@ -101,6 +102,7 @@ def save_arrivals(records):
         )
     """)
     
+    # --- CAMBIO: Uso de la hora de Madrid ---
     timestamp_recolection = datetime.now(MADRID_TZ).strftime("%Y-%m-%d %H:%M:%S")
     initial_changes = conn.total_changes
     
@@ -164,6 +166,7 @@ def save_departures(records):
         )
     """)
 
+    # --- CAMBIO: Uso de la hora de Madrid ---
     timestamp_recolection = datetime.now(MADRID_TZ).strftime("%Y-%m-%d %H:%M:%S")
     initial_changes = conn.total_changes
     
@@ -218,6 +221,7 @@ def home():
 @app.get("/ping")
 def ping_service():
     """Endpoint simple para mantener el servicio activo."""
+    # --- CAMBIO: Uso de la hora de Madrid en el ping también ---
     now = datetime.now(MADRID_TZ).strftime("%Y-%m-%d %H:%M:%S")
     return JSONResponse(content={"status": "alive", "timestamp_madrid": now, "message": "Service is awake."}, status_code=200)
 
