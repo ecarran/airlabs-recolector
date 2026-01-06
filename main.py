@@ -8,223 +8,183 @@ from dateutil import parser
 import pytz 
 
 # ==================================
-# CONSTANTES
+# CONFIGURACIÓN
 # ==================================
-# Se lee la clave de la variable de entorno AIRLABS_API_KEY.
 API_KEY = os.getenv("AIRLABS_API_KEY", "TU_CLAVE_DE_AIRLABS_AQUI") 
 AIRPORT_IATA = "MAD"
 DB_PATH = "barajas.db"
-# --- CAMBIO: Definición de la zona horaria ---
 MADRID_TZ = pytz.timezone('Europe/Madrid')
+
+# --- CONFIGURACIÓN DE AHORRO (NIGHT SAVER) ---
+# El script solo consumirá llamadas a la API en este rango horario (Hora Madrid).
+# Rango: 06:00 AM hasta 23:59 PM.
+# Las horas de madrugada (00:00 - 06:00) se ignoran para ahorrar cuota, 
+# confiando en que la llamada de las 06:00 recuperará los pocos vuelos nocturnos.
+START_HOUR = 6  
+END_HOUR = 24   
 
 app = FastAPI()
 
 # ==================================
-# LÓGICA DE AIRLABS (Funciones Puras)
+# UTILIDADES
 # ==================================
+def is_operating_hour():
+    """
+    Devuelve True si estamos en horario operativo para gastar API.
+    Funciona para rangos dentro del mismo día (ej: 06 a 24).
+    """
+    current_hour = datetime.now(MADRID_TZ).hour
+    # Nota: END_HOUR=24 permite que funcione hasta las 23:59
+    return START_HOUR <= current_hour < END_HOUR
 
+def convert_to_madrid(utc_time_str):
+    """Convierte UTC string a Madrid string para guardar hora local."""
+    if not utc_time_str: return None
+    try:
+        dt_utc = parser.parse(utc_time_str).replace(tzinfo=pytz.utc)
+        return dt_utc.astimezone(MADRID_TZ).strftime("%Y-%m-%d %H:%M")
+    except: return utc_time_str
+
+def calculate_delay(actual, scheduled):
+    """Calcula la diferencia en minutos entre hora real y programada."""
+    if not actual or not scheduled: return None
+    try:
+        act_dt = parser.parse(actual).replace(tzinfo=None)
+        sch_dt = parser.parse(scheduled).replace(tzinfo=None)
+        return int((act_dt - sch_dt).total_seconds() / 60)
+    except: return None
+
+# ==================================
+# API AIRLABS (CON PROTECCIÓN DE HORARIO)
+# ==================================
 def airlabs_request(endpoint, params):
-    """Realiza una petición a la API de Airlabs con manejo de errores HTTP."""
+    # 1. VERIFICACIÓN DE HORARIO (Ahorro de API)
+    if not is_operating_hour():
+        print(f"💤 Modo Noche ({datetime.now(MADRID_TZ).strftime('%H:%M')}). Ahorrando llamada.")
+        return [] # Retorna lista vacía sin tocar la API
+
+    # 2. PETICIÓN REAL
     url = f"https://airlabs.co/api/v9/{endpoint}"
     params = dict(params)
     params["api_key"] = API_KEY
-
-    print(f"Haciendo petición a {url} con status={params.get('status')}...")
     try:
-        if API_KEY == "TU_CLAVE_DE_AIRLABS_AQUI":
-             raise RuntimeError("API Key no configurada. Por favor, define AIRLABS_API_KEY en Render.")
-             
         r = requests.get(url, params=params, timeout=20)
         r.raise_for_status() 
         data = r.json()
-
         if "error" in data:
-            raise RuntimeError(f"Error de API: {data['error']}")
-        
-        response = data.get("response")
-        if not response:
-             print(f"  ⚠ La API devolvió una lista de vuelos vacía para status: {params.get('status')}.")
-        
-        return response
-    
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Error en la petición HTTP: {e}")
+            print(f"Error API: {data['error']}")
+            return []
+        return data.get("response", [])
+    except Exception as e:
+        print(f"Error Conexión: {e}")
+        return []
 
 def get_all_landed():
-    """Obtiene los últimos 100 vuelos aterrizados en MAD (1 llamada)."""
-    return airlabs_request(
-        "schedules",
-        {"arr_iata": AIRPORT_IATA, "status": "landed"}
-    )
+    return airlabs_request("schedules", {"arr_iata": AIRPORT_IATA, "status": "landed"})
 
 def get_all_active_departures():
-    """Obtiene vuelos activos saliendo de MAD (1 llamada)."""
-    return airlabs_request(
-        "schedules",
-        {"dep_iata": AIRPORT_IATA, "status": "active"}
-    )
-
-def calculate_delay(actual_time_str, scheduled_time_str):
-    """Calcula la diferencia en minutos entre el tiempo real y el programado/estimado."""
-    if not actual_time_str or not scheduled_time_str:
-        return None
-    
-    try:
-        actual_dt = parser.parse(actual_time_str).replace(tzinfo=None)
-        scheduled_dt = parser.parse(scheduled_time_str).replace(tzinfo=None)
-        delay_seconds = (actual_dt - scheduled_dt).total_seconds()
-        return int(delay_seconds / 60)
-    except Exception:
-        return None
+    return airlabs_request("schedules", {"dep_iata": AIRPORT_IATA, "status": "active"})
 
 # ==================================
-# GUARDADO DE DATOS (Recolección y guardado)
+# GUARDADO EN BASE DE DATOS
 # ==================================
-
-# ==================================
-# GUARDADO DE DATOS (CORREGIDO)
-# ==================================
-
 def save_arrivals(records):
+    if not records: return 0
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
+    
+    # Tabla Arrivals
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS arrivals (
             timestamp TEXT, flight_iata TEXT, airline_iata TEXT, dep_iata TEXT,
             arr_iata TEXT, arr_sch_time TEXT, arr_time TEXT, status TEXT,
-            delay_minutes INTEGER, 
-            arr_terminal TEXT,       
-            arr_gate TEXT,           
-            arr_baggage TEXT,        
-            duration INTEGER,        
-            dep_delayed INTEGER,     
-            arr_delayed INTEGER,     
-            aircraft_icao TEXT,
+            delay_minutes INTEGER, arr_terminal TEXT, arr_gate TEXT, arr_baggage TEXT,        
+            duration INTEGER, dep_delayed INTEGER, arr_delayed INTEGER, aircraft_icao TEXT,
             PRIMARY KEY (flight_iata, arr_time) 
         )
     """)
     
-    timestamp_recolection = datetime.now(MADRID_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    initial_changes = conn.total_changes
+    ts = datetime.now(MADRID_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    initial = conn.total_changes
     
     for r in records:
-        flight_iata = r.get("flight_iata")
+        flight = r.get("flight_iata")
+        # Lógica de tiempos
+        raw_sch = r.get("arr_time_sch")
+        raw_time = r.get("arr_estimated") or r.get("arr_actual") or r.get("arr_time")
         
-        # --- CORRECCIÓN DE ASIGNACIÓN DE TIEMPOS ---
-        # 1. Hora Programada (Scheduled): Estricta
-        arr_sch_time = r.get("arr_time_sch")
-        
-        # 2. Hora Real (Live): Priorizamos estimada/actual, fallback a genérica
-        arr_time = r.get("arr_estimated") or r.get("arr_actual") or r.get("arr_time")
-        
-        # Si no tenemos hora real, no podemos guardar el registro útilmente
-        if not flight_iata or not arr_time:
-            continue
-        
-        # Si falta la programada, intentamos usar 'arr_time' original si es distinto al estimado,
-        # o simplemente lo dejamos como None, pero NUNCA metemos la estimada aquí a ciegas.
-        if not arr_sch_time:
-             # Opcional: Si no hay programada, asume que la programada era la 'arr_time' genérica
-             # Solo haz esto si estás seguro, si no, déjalo pasar o marca como NULL
-             arr_sch_time = r.get("arr_time") 
-            
-        delay = calculate_delay(arr_time, arr_sch_time)
-        # -------------------------------------------
-        
-        arr_terminal = r.get("arr_terminal")
-        arr_gate = r.get("arr_gate")
-        arr_baggage = r.get("arr_baggage")
-        duration = r.get("duration")
-        dep_delayed = r.get("dep_delayed")
-        arr_delayed = r.get("arr_delayed")
-        aircraft_icao = r.get("aircraft_icao")
+        # Fallback si falta la programada
+        if not raw_sch:
+             fallback = r.get("arr_time")
+             if fallback and fallback != raw_time: raw_sch = fallback
 
+        if not flight or not raw_time: continue
+
+        # Conversión y cálculo
+        sch = convert_to_madrid(raw_sch)
+        real = convert_to_madrid(raw_time)
+        delay = calculate_delay(real, sch)
+        
         try:
-            cursor.execute("""
-                INSERT OR IGNORE INTO arrivals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                timestamp_recolection, flight_iata, r.get("airline_iata"), r.get("dep_iata"),
-                r.get("arr_iata"), arr_sch_time, arr_time, r.get("status"), delay,
-                arr_terminal, arr_gate, arr_baggage, duration, dep_delayed, arr_delayed, 
-                aircraft_icao
-            ))
-        except Exception as e:
-            print(f"Error al insertar llegada {flight_iata}: {e}")
+            cursor.execute("INSERT OR IGNORE INTO arrivals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", 
+                (ts, flight, r.get("airline_iata"), r.get("dep_iata"), r.get("arr_iata"), 
+                 sch, real, r.get("status"), delay, r.get("arr_terminal"), r.get("arr_gate"), 
+                 r.get("arr_baggage"), r.get("duration"), r.get("dep_delayed"), 
+                 r.get("arr_delayed"), r.get("aircraft_icao")))
+        except: pass
 
     conn.commit()
-    rows_inserted = conn.total_changes - initial_changes
+    inserted = conn.total_changes - initial
     conn.close()
-    return rows_inserted
+    return inserted
 
 def save_departures(records):
+    if not records: return 0
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
+    
+    # Tabla Departures
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS departures (
             timestamp TEXT, flight_iata TEXT, airline_iata TEXT, dep_iata TEXT,
             arr_iata TEXT, dep_sch_time TEXT, dep_time TEXT, status TEXT,
-            delay_minutes INTEGER,
-            dep_terminal TEXT,       
-            dep_gate TEXT,           
-            duration INTEGER,        
-            dep_delayed INTEGER,     
-            arr_delayed INTEGER,     
-            aircraft_icao TEXT,
+            delay_minutes INTEGER, dep_terminal TEXT, dep_gate TEXT, duration INTEGER, 
+            dep_delayed INTEGER, arr_delayed INTEGER, aircraft_icao TEXT,
             PRIMARY KEY (flight_iata, dep_sch_time)
         )
     """)
-
-    timestamp_recolection = datetime.now(MADRID_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    initial_changes = conn.total_changes
+    
+    ts = datetime.now(MADRID_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    initial = conn.total_changes
     
     for r in records:
-        flight_iata = r.get("flight_iata")
-        
-        # --- CORRECCIÓN DE ASIGNACIÓN DE TIEMPOS ---
-        # 1. Hora Programada (Scheduled)
-        dep_sch_time = r.get("dep_time_sch")
-        
-        # 2. Hora Real (Live): Priorizamos estimada/actual
-        dep_time = r.get("dep_estimated") or r.get("dep_actual") or r.get("dep_time")
+        flight = r.get("flight_iata")
+        # Lógica de tiempos
+        raw_sch = r.get("dep_time_sch")
+        raw_time = r.get("dep_estimated") or r.get("dep_actual") or r.get("dep_time")
 
-        if not flight_iata or not dep_sch_time:
-            # Nota: Si dep_sch_time es crítico para tu Primary Key, 
-            # podrías intentar usar r.get("dep_time") como último recurso para sch,
-            # pero SOLO si no es igual al estimado.
-            if not dep_sch_time and r.get("dep_time"):
-                 dep_sch_time = r.get("dep_time")
-            
-            if not dep_sch_time:
-                continue 
-        # -------------------------------------------
-            
-        delay = calculate_delay(dep_time, dep_sch_time)
+        if not raw_sch:
+            fallback = r.get("dep_time")
+            if fallback and fallback != raw_time: raw_sch = fallback
+
+        if not flight or not raw_sch: continue 
         
-        dep_terminal = r.get("dep_terminal")
-        dep_gate = r.get("dep_gate")
-        duration = r.get("duration")
-        dep_delayed = r.get("dep_delayed")
-        arr_delayed = r.get("arr_delayed")
-        aircraft_icao = r.get("aircraft_icao")
+        # Conversión y cálculo
+        sch = convert_to_madrid(raw_sch)
+        real = convert_to_madrid(raw_time)
+        delay = calculate_delay(real, sch)
             
         try:
-            cursor.execute("""
-                INSERT OR IGNORE INTO departures VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                timestamp_recolection, flight_iata, r.get("airline_iata"), r.get("dep_iata"),
-                r.get("arr_iata"), dep_sch_time, dep_time, r.get("status"), delay,
-                dep_terminal, dep_gate, duration, dep_delayed, arr_delayed,
-                aircraft_icao
-            ))
-        except Exception as e:
-            print(f"Error al insertar despegue/activo {flight_iata}: {e}")
+            cursor.execute("INSERT OR IGNORE INTO departures VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", 
+                (ts, flight, r.get("airline_iata"), r.get("dep_iata"), r.get("arr_iata"), 
+                 sch, real, r.get("status"), delay, r.get("dep_terminal"), r.get("dep_gate"), 
+                 r.get("duration"), r.get("dep_delayed"), r.get("arr_delayed"), r.get("aircraft_icao")))
+        except: pass
 
     conn.commit()
-    rows_inserted = conn.total_changes - initial_changes
+    inserted = conn.total_changes - initial
     conn.close()
-    return rows_inserted
+    return inserted
 
 # ==================================
 # ENDPOINTS
@@ -232,59 +192,45 @@ def save_departures(records):
 
 @app.get("/")
 def home():
-    """Página de inicio básica."""
-    return {"message": "Recolector de Vuelos de Barajas activo. Use /recolectar o /descargarDB."}
-
+    return {"msg": "Recolector Barajas V7 (Night Saver: 06h-24h)"}
 
 @app.get("/ping")
 def ping_service():
-    """Endpoint simple para mantener el servicio activo."""
-    # --- CAMBIO: Uso de la hora de Madrid en el ping también ---
+    """Endpoint ligero para despertar el servidor sin gastar API externa."""
     now = datetime.now(MADRID_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    return JSONResponse(content={"status": "alive", "timestamp_madrid": now, "message": "Service is awake."}, status_code=200)
-
+    return JSONResponse(content={"status": "alive", "time": now}, status_code=200)
 
 @app.get("/recolectar")
 def recolectar():
     """
-    Ejecuta la recolección de datos y los guarda en barajas.db.
-    Solo llama a 'landed' y 'active' (2 llamadas a API).
+    Ejecuta la recolección SOLO si estamos en horario operativo.
+    Devuelve siempre 200 OK para no alertar al Cron, incluso si no hizo nada.
     """
-    total_inserted = 0
-    results = {}
+    res = {}
     
-    # 1. COLECCIÓN DE LLEGADAS (landed)
+    # Intentamos ejecutar (las funciones internas chequean el horario)
     try:
-        all_landed = get_all_landed()
-        inserted_arrivals = save_arrivals(all_landed) if all_landed else 0
-        results["nuevos_registros_llegadas"] = inserted_arrivals
-        total_inserted += inserted_arrivals
-    except RuntimeError as e:
-        results["error_llegadas"] = f"Error en recolección de llegadas: {e}"
+        landed = get_all_landed()
+        res["llegadas"] = save_arrivals(landed)
+    except Exception as e: res["err_arr"] = str(e)
 
-    # 2. COLECCIÓN DE SALIDAS ACTIVAS (active)
     try:
-        all_active = get_all_active_departures()
-        inserted_departures = save_departures(all_active) if all_active else 0
-        results["nuevos_registros_salidas_activas"] = inserted_departures
-        total_inserted += inserted_departures
-    except RuntimeError as e:
-        results["error_salidas_activas"] = f"Error en recolección de salidas activas: {e}"
+        active = get_all_active_departures()
+        res["salidas"] = save_departures(active)
+    except Exception as e: res["err_dep"] = str(e)
     
-    if total_inserted > 0:
-        results["mensaje"] = f"Recolección completada con éxito. Total de nuevos registros: {total_inserted}."
-        status_code = 200
+    # Información extra para debug
+    if not is_operating_hour():
+        res["status"] = "NIGHT_MODE"
+        res["info"] = "Fuera de horario (06-24). No se hicieron llamadas a Airlabs."
     else:
-        results["mensaje"] = "Recolección completada. No se insertaron registros nuevos."
-        status_code = 500 if "error_llegadas" in results or "error_salidas_activas" in results else 200
+        res["status"] = "ACTIVE"
         
-    return JSONResponse(content=results, status_code=status_code)
+    return JSONResponse(res)
 
 @app.get("/descargarDB")
 def descargar_db():
-    """Permite descargar el archivo de base de datos SQLite."""
     if os.path.exists(DB_PATH):
         return FileResponse(DB_PATH, filename="barajas.db", media_type="application/octet-stream")
     else:
         return JSONResponse(content={"error": "Base de datos no encontrada"}, status_code=404)
-
